@@ -1,0 +1,37 @@
+# Python build directories
+/build/
+/dist/
+/__pycache__/
+
+# Python compiled files
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+*.egg-info/
+*.egg
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs and databases
+*.log
+*.sqlite
+
+# Build artifacts
+*.spec
+
+# Windows specific
+Thumbs.db
+Desktop.ini
+
+# Test files
+test_*.py 

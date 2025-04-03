@@ -1,0 +1,8 @@
+pyqt5>=5.15.9
+pandas>=2.0.0
+numpy>=1.24.0
+pyproj>=3.5.0
+georinex>=1.13.0
+matplotlib>=3.7.1
+Pillow>=10.0.0
+piexif>=1.1.3 
