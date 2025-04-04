@@ -869,10 +869,13 @@ class DJIPPKPro(QMainWindow):
         self.antenna_height_input.setDecimals(3)
         self.antenna_height_input.setSingleStep(0.1)
         self.antenna_height_unit_label = QLabel("(m)")  # This will be updated dynamically
+        self.antenna_height_warning = QLabel()  # Add warning label
+        self.antenna_height_warning.setStyleSheet("color: #FFA500; font-style: italic;")  # Orange warning color
         
         antenna_layout.addWidget(antenna_label)
         antenna_layout.addWidget(self.antenna_height_input)
         antenna_layout.addWidget(self.antenna_height_unit_label)
+        antenna_layout.addWidget(self.antenna_height_warning)
         base_layout.addLayout(antenna_layout)
         
         # RINEX file selection
@@ -1309,29 +1312,40 @@ class DJIPPKPro(QMainWindow):
                 self.update_base_position_info()
                 
                 # Check if the CSV contains antenna height and update the UI
+                antenna_height_found = False
                 if 'Antenna height' in point_data and not pd.isna(point_data['Antenna height']):
                     try:
                         antenna_height = float(point_data['Antenna height'])
                         # Get units from CSV or default to feet
-                        units = str(point_data['Antenna height units']).lower() if 'Antenna height units' in point_data else 'ft'
-                        self.antenna_height_units = units
+                        csv_units = str(point_data['Antenna height units']).lower() if 'Antenna height units' in point_data else 'ft'
                         
-                        # Set the value in the UI
+                        # Use the units directly from CSV without any conversion
+                        self.antenna_height_units = csv_units
                         self.antenna_height_input.setValue(antenna_height)
+                        
                         if hasattr(self, 'antenna_height_unit_label'):
-                            self.antenna_height_unit_label.setText(units)
+                            self.antenna_height_unit_label.setText(csv_units)
                             
-                        # Store antenna height in base_station_data
+                        # Store antenna height in base_station_data with original units
                         self.base_station_data['antenna_height'] = antenna_height
-                        self.base_station_data['antenna_height_units'] = units
+                        self.base_station_data['antenna_height_units'] = csv_units
                             
-                        logger.info(f"Updated antenna height from CSV to {antenna_height}{units}")
+                        logger.info(f"Updated antenna height from CSV: {antenna_height} {csv_units}")
+                        antenna_height_found = True
+                        self.antenna_height_warning.setText("")  # Clear any warning
                     except (ValueError, TypeError) as e:
                         logger.warning(f"Could not convert antenna height value: {str(e)}")
-                else:
-                    # Set default values
-                    default_height = 7.001  # Default in feet
-                    default_units = 'ft'
+                        antenna_height_found = False
+                
+                if not antenna_height_found:
+                    # Set default values based on coordinate system units
+                    if hasattr(self, 'is_feet_based') and self.is_feet_based:
+                        default_height = 7.001  # Default in feet
+                        default_units = 'ft'
+                    else:
+                        default_height = 2.134  # Default in meters
+                        default_units = 'm'
+                    
                     self.antenna_height_units = default_units
                     self.antenna_height_input.setValue(default_height)
                     if hasattr(self, 'antenna_height_unit_label'):
@@ -1340,8 +1354,11 @@ class DJIPPKPro(QMainWindow):
                     # Store default antenna height in base_station_data
                     self.base_station_data['antenna_height'] = default_height
                     self.base_station_data['antenna_height_units'] = default_units
-                        
-                    logger.info(f"Set default antenna height to {default_height}{default_units}")
+                    
+                    # Show warning about default value
+                    warning_text = f"No antenna height found. Using default: {default_height} {default_units}"
+                    self.antenna_height_warning.setText(warning_text)
+                    logger.info(f"Set default antenna height to {default_height} {default_units}")
                 
                 # If we have a RINEX file, calculate position correction immediately
                 if self.rinex_input.text() and os.path.exists(self.rinex_input.text()):
@@ -1457,32 +1474,29 @@ class DJIPPKPro(QMainWindow):
             return []
 
     def validate_inputs(self):
-        """Validate all inputs before processing"""
-        if not self.dir_input.text():
-            raise ValueError("Please select a project directory")
-        
-        if not self.detected_files:
-            raise ValueError("No CSV files detected in project directory")
+        """Validate all required inputs are present and valid"""
+        if not hasattr(self, 'project_dir') or not self.project_dir:
+            raise ValueError("Please select a project directory first")
             
-        if not self.epsg_input.text():
-            raise ValueError("Please enter an output EPSG code")
+        if not self.rinex_input.text():
+            raise ValueError("Please select a RINEX base station file")
             
         if self.base_point_combo.currentIndex() == 0:
             raise ValueError("Please select a base station point")
             
-        try:
-            epsg_code = int(self.epsg_input.text())
-            pyproj.CRS.from_epsg(epsg_code)
-        except ValueError:
-            raise ValueError("Invalid EPSG code")
+        # Validate base station coordinates
+        if not hasattr(self, 'base_points_df') or self.base_points_df is None:
+            raise ValueError("Base station coordinates are incomplete")
+            
+        # Get antenna height
+        antenna_height = self.antenna_height_input.value()
         
-        # Check if we have a RINEX file
-        if not hasattr(self, 'original_rinex_path') or not self.original_rinex_path:
-            raise ValueError("No RINEX file loaded")
-        
-        # Check if we have valid RINEX time span
-        if not hasattr(self, 'rinex_start') or not hasattr(self, 'rinex_end'):
-            raise ValueError("RINEX file does not have valid time information")
+        # Convert antenna height to meters if needed (RINEX expects meters)
+        if self.antenna_height_unit_label.text() == "(ft)":
+            antenna_height = antenna_height * 0.3048  # Convert feet to meters
+            logger.debug(f"Converting antenna height from {self.antenna_height_input.value()} ft to {antenna_height} m")
+            
+        return antenna_height
 
     def get_active_rinex_path(self):
         """Get the actual RINEX file to use (either original or corrected)"""
@@ -1493,124 +1507,40 @@ class DJIPPKPro(QMainWindow):
         return None
             
     def process_button_clicked(self):
-        """Handle click on Process PPK Data button"""
+        """Handle process button click"""
         try:
             # Validate inputs
-            if not hasattr(self, 'base_station_data') or not self.base_station_data:
-                raise ValueError("Please select a base station point first")
-                
-            if not self.rinex_input.text():
-                raise ValueError("Please select a RINEX base station file")
-                
-            # Disable button during processing
-            self.process_button.setEnabled(False)
-            self.statusBar().showMessage("Processing PPK data...")
+            antenna_height = self.validate_inputs()
             
-            # Create the corrected RINEX file here - NOT during initial loading
-            rinex_file = self.rinex_input.text()
+            # Get RINEX file path
+            rinex_file = self.get_active_rinex_path()
             
-            # Get base station info
-            base_lat = self.base_station_data['latitude']
-            base_lon = self.base_station_data['longitude']
-            base_ellh = self.base_station_data['ellipsoidal_height']
-            antenna_height = self.antenna_height_input.value()
-            antenna_units = self.antenna_height_units if hasattr(self, 'antenna_height_units') else 'ft'
-            coord_system_units = 'ft' if self.is_feet_based else 'm'
+            # Get base station coordinates
+            base_point = self.base_point_combo.currentText()
+            base_data = self.base_points_df[self.base_points_df['Name'] == base_point].iloc[0]
             
-            # Update RINEX base position - This creates the corrected file
-            corrected_file, total_shift, horizontal_shift, vertical_shift, success = update_rinex_base_position(
-                rinex_file,
-                base_lat,
-                base_lon,
-                base_ellh,
-                antenna_height,
-                antenna_units,
-                coord_system_units
+            # Create worker thread
+            self.worker = RinexLoadWorker(
+                rinex_file=rinex_file,
+                base_lat=base_data['Latitude'],
+                base_lon=base_data['Longitude'],
+                base_ellh=base_data['Elevation'],
+                antenna_height=antenna_height,
+                antenna_height_units='m',  # Always in meters for RINEX
+                coord_system_units='m'  # Always in meters for RINEX
             )
             
-            if not success or not corrected_file:
-                raise ValueError("Failed to update base position in RINEX file")
-                
-            # Store the corrected file path
-            self.corrected_rinex_path = corrected_file
+            # Connect signals
+            self.worker.progress.connect(self.update_status)
+            self.worker.error.connect(self.handle_error)
+            self.worker.finished.connect(self.handle_rinex_completion)
             
-            # Update position correction display
-            position_shift_text = format_shift_display(horizontal_shift, vertical_shift)
-            if total_shift > 5.0:
-                self.position_correction_label.setText(f"LARGE SHIFT - {position_shift_text}")
-                self.position_correction_label.setStyleSheet("color: #FF9800; font-weight: bold;")  # Orange warning
-            else:
-                self.position_correction_label.setText(f"{position_shift_text}")
-                self.position_correction_label.setStyleSheet("color: #4CAF50; font-weight: bold;")  # Green success
-            
-            # Find all flight folders and copy the corrected RINEX file to each
-            project_dir = self.dir_input.text()
-            flight_folders = []
-            
-            # Find all DJI mission folders
-            for item in os.listdir(project_dir):
-                item_path = os.path.join(project_dir, item)
-                if os.path.isdir(item_path) and item.startswith("DJI_"):
-                    flight_folders.append(item_path)
-            
-            logger.info(f"Found {len(flight_folders)} flight folders to process")
-            successful_copies = 0
-            
-            # Process each flight folder
-            for i, folder in enumerate(flight_folders):
-                try:
-                    folder_name = os.path.basename(folder)
-                    self.update_status(f"Processing folder {i+1}/{len(flight_folders)}: {folder_name}")
-                    
-                    # Find RTK file in the folder
-                    rtk_files = [f for f in os.listdir(folder) if f.endswith('.RTK')]
-                    
-                    if not rtk_files:
-                        logger.warning(f"No .RTK files found in {folder}")
-                        continue
-                    
-                    # Use the first RTK file found
-                    rtk_file = rtk_files[0]
-                    logger.info(f"Found RTK file: {rtk_file}")
-                    
-                    # Generate new filename (same as RTK but with .OBS extension)
-                    obs_file = os.path.splitext(rtk_file)[0] + '.OBS'
-                    obs_path = os.path.join(folder, obs_file)
-                    
-                    # Copy the corrected RINEX file to the flight folder with the new name
-                    shutil.copy2(corrected_file, obs_path)
-                    logger.info(f"Copied corrected RINEX to: {obs_path}")
-                    successful_copies += 1
-                    
-                except Exception as e:
-                    logger.error(f"Error processing folder {folder}: {str(e)}")
-                    continue
-            
-            # Process all CSV files containing DJI position data
-            self.update_status("Processing position data...")
-            processed_data = self.process_position_data(corrected_file)
-            
-            if processed_data is not None:
-                self.processed_data = processed_data
-                self.export_button.setEnabled(True)
-                self.statusBar().showMessage(
-                    f"PPK processing complete - Processed {len(processed_data)} points, copied to {successful_copies} flight folders"
-                )
-            else:
-                self.statusBar().showMessage("PPK processing failed - see log for details")
+            # Start worker
+            self.worker.start()
             
         except Exception as e:
-            logger.error(f"Processing error: {str(e)}")
-            logger.error(traceback.format_exc())
-            self.statusBar().showMessage(f"Error: {str(e)}")
-            QMessageBox.critical(
-                self,
-                "Processing Error",
-                f"Failed to process PPK data: {str(e)}"
-            )
-        finally:
-            # Re-enable button
-            self.process_button.setEnabled(True)
+            logger.error(f"Error starting processing: {str(e)}")
+            self.handle_error(str(e))
 
     def read_rinex_data(self):
         """Read and process RINEX base station data"""
@@ -2286,663 +2216,105 @@ class DJIPPKPro(QMainWindow):
                 f"Failed to export data: {str(e)}"
             )
 
-    def show_epsg_search_dialog(self):
-        """Show a dialog with common coordinate systems that can be searched and selected"""
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Coordinate System Search")
-        dialog.setMinimumWidth(600)
-        dialog.setMinimumHeight(500)
-        
-        # Apply dark theme to the dialog
-        dialog.setStyleSheet("""
-            QDialog {
-                background-color: #333333;
-                color: white;
-            }
-            QLabel {
-                color: white;
-            }
-            QTreeWidget {
-                background-color: #424242;
-                color: white;
-                border: 1px solid #555;
-                border-radius: 3px;
-            }
-            QTreeWidget::item:selected {
-                background-color: #2979FF;
-            }
-            QLineEdit {
-                background-color: #424242;
-                color: white;
-                border: 1px solid #555;
-                border-radius: 3px;
-                padding: 4px;
-            }
-            QPushButton {
-                background-color: #424242;
-                color: white;
-                border: 1px solid #555;
-                border-radius: 3px;
-                padding: 6px 12px;
-            }
-            QPushButton:hover {
-                background-color: #505050;
-            }
-            QPushButton:pressed {
-                background-color: #2979FF;
-            }
-        """)
-        
-        # Main layout
-        layout = QVBoxLayout(dialog)
-        
-        # Search field
-        search_layout = QHBoxLayout()
-        search_label = QLabel("Search:")
-        search_input = QLineEdit()
-        search_input.setPlaceholderText("Enter search terms")
-        
-        search_layout.addWidget(search_label)
-        search_layout.addWidget(search_input)
-        layout.addLayout(search_layout)
-        
-        # Tree widget for coordinate systems
-        tree = QTreeWidget()
-        tree.setHeaderLabels(["Name", "EPSG Code"])
-        tree.setColumnWidth(0, 350)  # Width of the first column
-        layout.addWidget(tree)
-        
-        # Populate with common coordinate systems organized by category
-        self.populate_coordinate_systems(tree)
-        
-        # Button layout
-        button_layout = QHBoxLayout()
-        select_button = QPushButton("Select")
-        cancel_button = QPushButton("Cancel")
-        
-        select_button.clicked.connect(dialog.accept)
-        cancel_button.clicked.connect(dialog.reject)
-        
-        button_layout.addStretch()
-        button_layout.addWidget(select_button)
-        button_layout.addWidget(cancel_button)
-        layout.addLayout(button_layout)
-        
-        # Connect search functionality
-        search_input.textChanged.connect(lambda text: self.filter_coordinate_systems(tree, text))
-        
-        # Connect double-click to select
-        tree.itemDoubleClicked.connect(dialog.accept)
-        
-        # Show dialog and handle result
-        if dialog.exec_() == QDialog.Accepted:
-            selected_items = tree.selectedItems()
-            if selected_items:
-                # Get the EPSG code from the second column
-                epsg_code = selected_items[0].text(1)
-                self.epsg_input.setText(epsg_code)
-                
-    def populate_coordinate_systems(self, tree):
-        """Populate the tree widget with coordinate systems by category"""
-        # Dictionary of coordinate systems by category
-        coordinate_systems = {
-            "World Geodetic System": [
-                ("WGS84 (World) - Lat/Long", "4326"),
-            ],
-            "NAD83(2011) State Plane - US Survey Feet": [
-                ("NAD83(2011) / Alabama East (US feet)", "6465"),
-                ("NAD83(2011) / Alabama West (US feet)", "6466"),
-                ("NAD83(2011) / Arizona East (US feet)", "6483"),
-                ("NAD83(2011) / Arizona Central (US feet)", "6484"),
-                ("NAD83(2011) / Arizona West (US feet)", "6485"),
-                ("NAD83(2011) / Arkansas North (US feet)", "6486"),
-                ("NAD83(2011) / Arkansas South (US feet)", "6487"),
-                ("NAD83(2011) / California Zone 1 (US feet)", "6471"),
-                ("NAD83(2011) / California Zone 2 (US feet)", "6472"),
-                ("NAD83(2011) / California Zone 3 (US feet)", "6473"),
-                ("NAD83(2011) / California Zone 4 (US feet)", "6474"),
-                ("NAD83(2011) / California Zone 5 (US feet)", "6475"),
-                ("NAD83(2011) / California Zone 6 (US feet)", "6476"),
-                ("NAD83(2011) / Colorado North (US feet)", "6488"),
-                ("NAD83(2011) / Colorado Central (US feet)", "6489"),
-                ("NAD83(2011) / Colorado South (US feet)", "6490"),
-                ("NAD83(2011) / Connecticut (US feet)", "6491"),
-                ("NAD83(2011) / Delaware (US feet)", "6492"),
-                ("NAD83(2011) / Florida East (US feet)", "6497"),
-                ("NAD83(2011) / Florida West (US feet)", "6498"),
-                ("NAD83(2011) / Florida North (US feet)", "6441"),
-                ("NAD83(2011) / Georgia East (US feet)", "6500"),
-                ("NAD83(2011) / Georgia West (US feet)", "6501"),
-                ("NAD83(2011) / Idaho East (US feet)", "6502"),
-                ("NAD83(2011) / Idaho Central (US feet)", "6503"),
-                ("NAD83(2011) / Idaho West (US feet)", "6504"),
-                ("NAD83(2011) / Illinois East (US feet)", "6505"),
-                ("NAD83(2011) / Illinois West (US feet)", "6506"),
-                ("NAD83(2011) / Indiana East (US feet)", "6507"),
-                ("NAD83(2011) / Indiana West (US feet)", "6508"),
-                ("NAD83(2011) / Iowa North (US feet)", "6509"),
-                ("NAD83(2011) / Iowa South (US feet)", "6510"),
-                ("NAD83(2011) / Kansas North (US feet)", "6511"),
-                ("NAD83(2011) / Kansas South (US feet)", "6512"),
-                ("NAD83(2011) / Kentucky North (US feet)", "6513"),
-                ("NAD83(2011) / Kentucky South (US feet)", "6514"),
-                ("NAD83(2011) / Louisiana North (US feet)", "6515"),
-                ("NAD83(2011) / Louisiana South (US feet)", "6516"),
-                ("NAD83(2011) / Maine East (US feet)", "6517"),
-                ("NAD83(2011) / Maine West (US feet)", "6518"),
-                ("NAD83(2011) / Maryland (US feet)", "6519"),
-                ("NAD83(2011) / Massachusetts Mainland (US feet)", "6520"),
-                ("NAD83(2011) / Massachusetts Island (US feet)", "6521"),
-                ("NAD83(2011) / Michigan North (US feet)", "6522"),
-                ("NAD83(2011) / Michigan Central (US feet)", "6523"),
-                ("NAD83(2011) / Michigan South (US feet)", "6524"),
-                ("NAD83(2011) / Minnesota North (US feet)", "6525"),
-                ("NAD83(2011) / Minnesota Central (US feet)", "6526"),
-                ("NAD83(2011) / Minnesota South (US feet)", "6527"),
-                ("NAD83(2011) / Mississippi East (US feet)", "6528"),
-                ("NAD83(2011) / Mississippi West (US feet)", "6529"),
-                ("NAD83(2011) / Missouri East (US feet)", "6530"),
-                ("NAD83(2011) / Missouri Central (US feet)", "6531"),
-                ("NAD83(2011) / Missouri West (US feet)", "6532"),
-                ("NAD83(2011) / Montana (US feet)", "6533"),
-                ("NAD83(2011) / Nebraska (US feet)", "6534"),
-                ("NAD83(2011) / Nevada East (US feet)", "6535"),
-                ("NAD83(2011) / Nevada Central (US feet)", "6536"),
-                ("NAD83(2011) / Nevada West (US feet)", "6537"),
-                ("NAD83(2011) / New Hampshire (US feet)", "6538"),
-                ("NAD83(2011) / New Jersey (US feet)", "6539"),
-                ("NAD83(2011) / New Mexico East (US feet)", "6540"),
-                ("NAD83(2011) / New Mexico Central (US feet)", "6541"),
-                ("NAD83(2011) / New Mexico West (US feet)", "6542"),
-                ("NAD83(2011) / New York East (US feet)", "6544"),
-                ("NAD83(2011) / New York Central (US feet)", "6545"),
-                ("NAD83(2011) / New York West (US feet)", "6546"),
-                ("NAD83(2011) / New York Long Island (US feet)", "6547"),
-                ("NAD83(2011) / North Carolina (US feet)", "6543"),
-                ("NAD83(2011) / North Dakota North (US feet)", "6548"),
-                ("NAD83(2011) / North Dakota South (US feet)", "6549"),
-                ("NAD83(2011) / Ohio North (US feet)", "6550"),
-                ("NAD83(2011) / Ohio South (US feet)", "6551"),
-                ("NAD83(2011) / Oklahoma North (US feet)", "6552"),
-                ("NAD83(2011) / Oklahoma South (US feet)", "6553"),
-                ("NAD83(2011) / Oregon North (US feet)", "6554"),
-                ("NAD83(2011) / Oregon South (US feet)", "6555"),
-                ("NAD83(2011) / Pennsylvania North (US feet)", "6556"),
-                ("NAD83(2011) / Pennsylvania South (US feet)", "6557"),
-                ("NAD83(2011) / Rhode Island (US feet)", "6558"),
-                ("NAD83(2011) / South Carolina (US feet)", "6559"),
-                ("NAD83(2011) / South Dakota North (US feet)", "6560"),
-                ("NAD83(2011) / South Dakota South (US feet)", "6561"),
-                ("NAD83(2011) / Tennessee (US feet)", "6562"),
-                ("NAD83(2011) / Texas North (US feet)", "6563"),
-                ("NAD83(2011) / Texas North Central (US feet)", "6564"),
-                ("NAD83(2011) / Texas Central (US feet)", "6565"),
-                ("NAD83(2011) / Texas South Central (US feet)", "6566"),
-                ("NAD83(2011) / Texas South (US feet)", "6567"),
-                ("NAD83(2011) / Utah North (US feet)", "6568"),
-                ("NAD83(2011) / Utah Central (US feet)", "6569"),
-                ("NAD83(2011) / Utah South (US feet)", "6570"),
-                ("NAD83(2011) / Vermont (US feet)", "6571"),
-                ("NAD83(2011) / Virginia North (US feet)", "6572"),
-                ("NAD83(2011) / Virginia South (US feet)", "6573"),
-                ("NAD83(2011) / Washington North (US feet)", "6574"),
-                ("NAD83(2011) / Washington South (US feet)", "6575"),
-                ("NAD83(2011) / West Virginia North (US feet)", "6576"),
-                ("NAD83(2011) / West Virginia South (US feet)", "6577"),
-                ("NAD83(2011) / Wisconsin North (US feet)", "6578"),
-                ("NAD83(2011) / Wisconsin Central (US feet)", "6579"),
-                ("NAD83(2011) / Wisconsin South (US feet)", "6580"),
-                ("NAD83(2011) / Wyoming East (US feet)", "6581"),
-                ("NAD83(2011) / Wyoming East Central (US feet)", "6582"),
-                ("NAD83(2011) / Wyoming West Central (US feet)", "6583"),
-                ("NAD83(2011) / Wyoming West (US feet)", "6584"),
-                ("NAD83(2011) / Puerto Rico and Virgin Is. (US feet)", "6647"),
-            ],
-            "UTM Zones - Northern Hemisphere": [
-                ("WGS84 / UTM Zone 1N", "32601"),
-                ("WGS84 / UTM Zone 2N", "32602"),
-                ("WGS84 / UTM Zone 3N", "32603"),
-                ("WGS84 / UTM Zone 4N", "32604"),
-                ("WGS84 / UTM Zone 5N", "32605"),
-                ("WGS84 / UTM Zone 6N", "32606"),
-                ("WGS84 / UTM Zone 7N", "32607"),
-                ("WGS84 / UTM Zone 8N", "32608"),
-                ("WGS84 / UTM Zone 9N", "32609"),
-                ("WGS84 / UTM Zone 10N", "32610"),
-                ("WGS84 / UTM Zone 11N", "32611"),
-                ("WGS84 / UTM Zone 12N", "32612"),
-                ("WGS84 / UTM Zone 13N", "32613"),
-                ("WGS84 / UTM Zone 14N", "32614"),
-                ("WGS84 / UTM Zone 15N", "32615"),
-                ("WGS84 / UTM Zone 16N", "32616"),
-                ("WGS84 / UTM Zone 17N", "32617"),
-                ("WGS84 / UTM Zone 18N", "32618"),
-                ("WGS84 / UTM Zone 19N", "32619"),
-                ("WGS84 / UTM Zone 20N", "32620"),
-            ],
-            "UTM Zones - Southern Hemisphere": [
-                ("WGS84 / UTM Zone 1S", "32701"),
-                ("WGS84 / UTM Zone 2S", "32702"),
-                ("WGS84 / UTM Zone 3S", "32703"),
-                ("WGS84 / UTM Zone 4S", "32704"),
-                ("WGS84 / UTM Zone 5S", "32705"),
-                ("WGS84 / UTM Zone 6S", "32706"),
-                ("WGS84 / UTM Zone 7S", "32707"),
-                ("WGS84 / UTM Zone 8S", "32708"),
-                ("WGS84 / UTM Zone 9S", "32709"),
-                ("WGS84 / UTM Zone 10S", "32710"),
-                ("WGS84 / UTM Zone 11S", "32711"),
-                ("WGS84 / UTM Zone 12S", "32712"),
-                ("WGS84 / UTM Zone 13S", "32713"),
-                ("WGS84 / UTM Zone 14S", "32714"),
-                ("WGS84 / UTM Zone 15S", "32715"),
-                ("WGS84 / UTM Zone 16S", "32716"),
-                ("WGS84 / UTM Zone 17S", "32717"),
-                ("WGS84 / UTM Zone 18S", "32718"),
-                ("WGS84 / UTM Zone 19S", "32719"),
-                ("WGS84 / UTM Zone 20S", "32720"),
-            ],
-            "Universal Projections": [
-                ("WGS 84 / Pseudo-Mercator", "3857"), # Web Mercator used by Google Maps, OpenStreetMap
-                ("WGS 84 / World Mercator", "3395"),
-                ("WGS 84 / World Equidistant Cylindrical", "4087"),
-            ],
-        }
-        
-        # Populate the tree widget
-        for category, systems in coordinate_systems.items():
-            # Create category item
-            category_item = QTreeWidgetItem(tree)
-            category_item.setText(0, category)
-            category_item.setFlags(category_item.flags() & ~Qt.ItemIsSelectable)
-            
-            # Create system items
-            for system_name, epsg_code in systems:
-                system_item = QTreeWidgetItem(category_item)
-                system_item.setText(0, system_name)
-                system_item.setText(1, epsg_code)
-                
-    def filter_coordinate_systems(self, tree, search_text):
-        """Filter the coordinate systems tree based on search text"""
-        search_text = search_text.lower()
-        
-        # Show all if search is empty
-        if not search_text:
-            for i in range(tree.topLevelItemCount()):
-                parent = tree.topLevelItem(i)
-                parent.setHidden(False)
-                for j in range(parent.childCount()):
-                    parent.child(j).setHidden(False)
-            return
-        
-        # Search through all items
-        for i in range(tree.topLevelItemCount()):
-            parent = tree.topLevelItem(i)
-            visible_children = 0
-            
-            for j in range(parent.childCount()):
-                child = parent.child(j)
-                name = child.text(0).lower()
-                code = child.text(1).lower()
-                
-                # Check if search text is in name or code
-                if search_text in name or search_text in code:
-                    child.setHidden(False)
-                    visible_children += 1
-                else:
-                    child.setHidden(True)
-            
-            # Only show category if it has visible children
-            parent.setHidden(visible_children == 0)
-            parent.setExpanded(visible_children > 0)
-
-    def export_coordinate_transformation(self):
-        """Export data with coordinate transformation only (no PPK processing)"""
-        # Validate inputs
-        if not hasattr(self, 'project_dir') or not self.project_dir:
-            raise ValueError("Please select a project directory first")
-            
-        output_epsg = self.epsg_input.text().strip()
-        if not output_epsg:
-            raise ValueError("Please enter an output EPSG code")
-            
-        try:
-            # Verify EPSG code is valid
-            output_epsg_int = int(output_epsg)
-            output_crs = pyproj.CRS.from_epsg(output_epsg_int)
-        except (ValueError, pyproj.exceptions.CRSError):
-            raise ValueError(f"Invalid EPSG code: {output_epsg}")
-            
-        # Find CSV files
-        csv_files = []
-        for file in os.listdir(self.project_dir):
-            if file.endswith('.csv') and not file.startswith('processed_'):
-                csv_files.append(os.path.join(self.project_dir, file))
-                
-        if not csv_files:
-            raise ValueError("No CSV files found in the project directory")
-            
-        # Create output directory
-        output_dir = os.path.join(self.project_dir, "processed_output")
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Process each CSV file
-        processed_files = []
-        for i, csv_file in enumerate(csv_files):
-            # Update status
-            self.statusBar().showMessage(f"Processing file {i+1} of {len(csv_files)}: {os.path.basename(csv_file)}")
-            QApplication.processEvents()  # Keep UI responsive
-            
-            # Read CSV
-            df = pd.read_csv(csv_file)
-            
-            # Coordinate transformation
-            transformed_df = self.transform_coordinates(df, output_epsg_int)
-            
-            # Generate output filename
-            base_name = os.path.splitext(os.path.basename(csv_file))[0]
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_file = os.path.join(
-                output_dir,
-                f"{base_name}_transformed_{timestamp}.csv"
-            )
-            
-            # Export
-            transformed_df.to_csv(output_file, index=False)
-            processed_files.append(output_file)
-            
-        # Complete
-        self.statusBar().showMessage(f"Exported {len(processed_files)} files to {output_dir}")
-        
-        # Show success message
-        QMessageBox.information(
-            self,
-            "Export Successful",
-            f"Transformed {len(processed_files)} files to coordinate system EPSG:{output_epsg}\n"
-            f"Files have been saved to:\n{output_dir}"
-        )
-        
-        # Open the output directory
-        os.startfile(output_dir) if os.name == 'nt' else os.system(f'xdg-open "{output_dir}"')
-            
-    def transform_coordinates(self, df, output_epsg):
-        """Transform coordinates from input coordinate system to output coordinate system"""
-        # Create a copy of the dataframe
-        result_df = df.copy()
-        
-        # Determine the input coordinate system
-        input_epsg = None
-        
-        # Get column names (multiple formats possible)
-        lon_col = next((col for col in ['point_longitude(degree)', 'longitude', 'Longitude', 'lon', 'Lon'] 
-                        if col in df.columns), None)
-        lat_col = next((col for col in ['point_latitude(degree)', 'latitude', 'Latitude', 'lat', 'Lat'] 
-                        if col in df.columns), None)
-        height_col = next((col for col in ['Elevation', 'elevation', 'Height', 'height'] 
-                          if col in df.columns), None)
-        
-        easting_col = next((col for col in ['point_easting(m)', 'easting', 'Easting', 'east', 'East'] 
-                           if col in df.columns), None)
-        northing_col = next((col for col in ['point_northing(m)', 'northing', 'Northing', 'north', 'North'] 
-                            if col in df.columns), None)
-        
-        point_name_col = next((col for col in ['Name', 'name', 'point_name', 'Point_name', 'id', 'ID', 'point_id'] 
-                              if col in df.columns), None)
-        
-        # Initialize output columns
-        result_df['Easting'] = 0.0
-        result_df['Northing'] = 0.0
-        result_df['Elevation'] = df[height_col] if height_col else 0.0  # Preserve original elevation
-        result_df['Point_name'] = [f"Point_{i+1}" for i in range(len(df))]
-        if point_name_col:
-            result_df['Point_name'] = df[point_name_col]
-        
-        # Check for lat/long format (WGS84)
-        if lon_col and lat_col:
-            input_epsg = 4326  # WGS84
-            input_crs = pyproj.CRS.from_epsg(input_epsg)
-            output_crs = pyproj.CRS.from_epsg(output_epsg)
-            
-            # Create transformer
-            transformer = pyproj.Transformer.from_crs(input_crs, output_crs, always_xy=True)
-            
-            # Transform each point
-            for idx, row in df.iterrows():
-                try:
-                    # Convert to float and handle potential errors
-                    lon = float(row[lon_col]) if not pd.isna(row[lon_col]) else 0.0
-                    lat = float(row[lat_col]) if not pd.isna(row[lat_col]) else 0.0
-                    
-                    # Transform coordinates (horizontal only)
-                    easting, northing = transformer.transform(lon, lat)
-                    
-                    # Store results (as float)
-                    result_df.at[idx, 'Easting'] = float(easting)
-                    result_df.at[idx, 'Northing'] = float(northing)
-                except (ValueError, TypeError) as e:
-                    logger.warning(f"Error transforming point at index {idx}: {str(e)}")
-                    # Use default values for this point
-                    result_df.at[idx, 'Easting'] = 0.0
-                    result_df.at[idx, 'Northing'] = 0.0
-        
-        # Check for projected coordinates (easting/northing)
-        elif easting_col and northing_col:
-            # Try to determine the input EPSG from detected system
-            if hasattr(self, 'detected_epsg_code') and self.detected_epsg_code:
-                input_epsg = int(self.detected_epsg_code)
-                logger.info(f"Using detected EPSG code: {input_epsg}")
-            elif 'RTK_coor_system' in df.columns:
-                # Try to parse from RTK coordinate system string
-                coor_system = df['RTK_coor_system'].iloc[0]
-                logger.info(f"Using coordinate system from file: {coor_system}")
-                
-                # Use a default based on what we know about the file
-                if "NAD83" in coor_system and "Florida" in coor_system:
-                    if "North" in coor_system:
-                        input_epsg = 2236
-                    elif "East" in coor_system:
-                        input_epsg = 2238
-                    elif "West" in coor_system:
-                        input_epsg = 2239
-                    logger.info(f"Determined EPSG code {input_epsg} from coordinate system string")
-                # Add additional coordinate system detection patterns if needed
-                else:
-                    logger.warning("Could not automatically determine coordinate system from RTK system string")
-            elif 'CS name' in df.columns and not pd.isna(df['CS name'].iloc[0]):
-                # Try to parse from CS name
-                cs_name = df['CS name'].iloc[0]
-                logger.info(f"Found CS name: {cs_name}")
-                
-                # Check for recognized coordinate systems
-                if "NAD83" in cs_name and "Florida" in cs_name:
-                    if "North" in cs_name:
-                        input_epsg = 2236
-                    elif "East" in cs_name:
-                        input_epsg = 2238
-                    elif "West" in cs_name:
-                        input_epsg = 2239
-                    logger.info(f"Detected coordinate system: {cs_name}")
-                    logger.info(f"Auto-populated output EPSG code: {input_epsg}")
-                # Add more coordinate system detection patterns here as needed
-                else:
-                    logger.warning(f"Found coordinate system name but could not automatically determine EPSG code: {cs_name}")
-            
-            if not input_epsg:
-                # If we couldn't determine the input EPSG, show error
-                raise ValueError("Could not determine input coordinate system. Please select a project with a recognized coordinate system or manually enter the input EPSG code.")
-                
-            input_crs = pyproj.CRS.from_epsg(input_epsg)
-            output_crs = pyproj.CRS.from_epsg(output_epsg)
-            
-            # Create transformer
-            transformer = pyproj.Transformer.from_crs(input_crs, output_crs, always_xy=True)
-            
-            # Transform each point
-            for idx, row in df.iterrows():
-                try:
-                    # Convert to float and handle potential errors
-                    east = float(row[easting_col]) if not pd.isna(row[easting_col]) else 0.0
-                    north = float(row[northing_col]) if not pd.isna(row[northing_col]) else 0.0
-                    
-                    # Transform coordinates (horizontal only)
-                    easting, northing = transformer.transform(east, north)
-                    
-                    # Store results (as float)
-                    result_df.at[idx, 'Easting'] = float(easting)
-                    result_df.at[idx, 'Northing'] = float(northing)
-                except (ValueError, TypeError) as e:
-                    logger.warning(f"Error transforming point at index {idx}: {str(e)}")
-                    # Use default values for this point
-                    result_df.at[idx, 'Easting'] = 0.0
-                    result_df.at[idx, 'Northing'] = 0.0
-        else:
-            raise ValueError("Input CSV file does not contain recognized coordinate columns (longitude/latitude or easting/northing)")
-            
-        # Apply vertical system selection and unit conversion
-        vert_system = self.vert_combo.currentText()
-        logger.info(f"Using vertical system: {vert_system}")
-        
-        # Ensure Elevation column is numeric before unit conversion
-        result_df['Elevation'] = pd.to_numeric(result_df['Elevation'], errors='coerce').fillna(0.0)
-        
-        # Handle unit conversion for vertical coordinates
-        if "feet" in vert_system.lower():
-            if "US survey" in vert_system:
-                # Already in US survey feet, no conversion needed
-                logger.info("Keeping elevation in US survey feet")
-            else:
-                # Convert from US survey feet to international feet
-                result_df['Elevation'] = result_df['Elevation'] * (3.28084 / 3.28083333333333)
-                logger.info("Converting elevation from US survey feet to international feet")
-        else:
-            # Convert from US survey feet to meters
-            result_df['Elevation'] = result_df['Elevation'] / 3.28083333333333
-            logger.info("Converting elevation from US survey feet to meters")
-        
-        # Ensure all columns are numeric before rounding
-        result_df['Easting'] = pd.to_numeric(result_df['Easting'], errors='coerce').fillna(0.0)
-        result_df['Northing'] = pd.to_numeric(result_df['Northing'], errors='coerce').fillna(0.0)
-        result_df['Elevation'] = pd.to_numeric(result_df['Elevation'], errors='coerce').fillna(0.0)
-        
-        # Round to 3 decimal places
-        result_df['Easting'] = result_df['Easting'].round(3)
-        result_df['Northing'] = result_df['Northing'].round(3)
-        result_df['Elevation'] = result_df['Elevation'].round(3)
-        
-        # Add unit information to column names
-        vert_system = self.vert_combo.currentText()
-        
-        # Determine horizontal units based on output EPSG
-        output_crs = pyproj.CRS.from_epsg(output_epsg)
-        horiz_unit = "meters"  # Default
-        
-        try:
-            # Try to get units from the CRS
-            output_unit = output_crs.axis_info[0].unit_name
-            if "foot" in output_unit.lower() or "feet" in output_unit.lower():
-                if "us" in output_unit.lower() or "survey" in output_unit.lower():
-                    horiz_unit = "US survey feet"
-                else:
-                    horiz_unit = "feet"
-            logger.info(f"Detected horizontal unit from EPSG: {horiz_unit}")
-        except Exception as e:
-            logger.warning(f"Could not determine units from EPSG, using default 'meters': {str(e)}")
-        
-        # Determine vertical units from selected vertical system
-        vert_unit = "meters"  # Default
-        if "feet" in vert_system.lower():
-            if "US survey" in vert_system:
-                vert_unit = "US survey feet"
-            else:
-                vert_unit = "feet"
-        
-        # Create new column names with units
-        easting_col = f'Easting ({horiz_unit})'
-        northing_col = f'Northing ({horiz_unit})'
-        elevation_col = f'Elevation ({vert_unit})'
-        
-        # Create a new DataFrame with the proper columns to avoid rint method error
-        new_df = pd.DataFrame()
-        
-        # Ensure Point_name is populated
-        new_df['Point_name'] = result_df['Point_name']
-        
-        try:
-            # Convert to numeric explicitly with error handling
-            new_df[easting_col] = pd.to_numeric(result_df['Easting'], errors='coerce').fillna(0.0).round(3)
-            new_df[northing_col] = pd.to_numeric(result_df['Northing'], errors='coerce').fillna(0.0).round(3)
-            new_df[elevation_col] = pd.to_numeric(result_df['Elevation'], errors='coerce').fillna(0.0).round(3)
-            
-            logger.info(f"Successfully transformed coordinates to EPSG:{output_epsg}")
-        except Exception as e:
-            logger.error(f"Error creating output DataFrame: {str(e)}")
-            # Create empty columns as fallback
-            new_df[easting_col] = 0.0
-            new_df[northing_col] = 0.0
-            new_df[elevation_col] = 0.0
-        
-        return new_df
-
     def process_position_data(self, rinex_file):
-        """Process position data using the provided RINEX file
-        
-        Args:
-            rinex_file (str): Path to the corrected RINEX file
-            
-        Returns:
-            pandas.DataFrame or None: Processed data or None if processing failed
-        """
+        """Process position data from CSV files"""
         try:
-            # Find all CSV files in project directory
-            project_dir = self.dir_input.text()
+            # Find all CSV files
             csv_files = []
-            
-            for file in os.listdir(project_dir):
-                if file.endswith('.csv') and 'processed' not in file.lower():
-                    csv_files.append(os.path.join(project_dir, file))
+            for file in os.listdir(self.project_dir):
+                if file.endswith('.csv') and not file.startswith('processed_'):
+                    csv_files.append(os.path.join(self.project_dir, file))
             
             if not csv_files:
-                logger.warning("No CSV files found for processing")
-                return None
+                raise ValueError("No CSV files found in project directory")
+            
+            # Process each CSV file
+            all_data = []
+            for csv_file in csv_files:
+                df = pd.read_csv(csv_file)
                 
-            logger.info(f"Found {len(csv_files)} CSV files for processing")
-            
-            # Process each CSV file (this is a placeholder for actual PPK processing)
-            # In a real implementation, this would use the corrected RINEX file to improve
-            # the accuracy of the drone position data in the CSV files
-            processed_dfs = []
-            
-            for i, csv_file in enumerate(csv_files):
-                try:
-                    self.update_status(f"Processing CSV {i+1}/{len(csv_files)}: {os.path.basename(csv_file)}")
-                    
-                    # Read the CSV
-                    df = pd.read_csv(csv_file)
-                    
-                    # Add some processing information columns
-                    df['processed'] = True
-                    df['rinex_file'] = os.path.basename(rinex_file)
-                    df['process_date'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    
-                    # Add to list of processed dataframes
-                    processed_dfs.append(df)
-                    
-                except Exception as e:
-                    logger.error(f"Error processing CSV file {csv_file}: {str(e)}")
-                    continue
-            
-            if not processed_dfs:
-                logger.warning("No CSV files were successfully processed")
-                return None
+                # Get coordinate system selection
+                is_global = self.coord_sys_toggle.currentText() == "Global (WGS84)"
                 
-            # Combine all processed dataframes
-            combined_df = pd.concat(processed_dfs, ignore_index=True)
-            logger.info(f"Successfully processed {len(combined_df)} points")
+                if is_global:
+                    # Global coordinate system (WGS84)
+                    # Get height unit selection for output
+                    output_height_unit = "m" if self.global_height_combo.currentText() == "meters" else "ft"
+                    
+                    # Copy name
+                    df['Name'] = df['Name']
+                    
+                    # Get column order selection
+                    is_longitude_first = "Name, Longitude" in self.col_order_toggle.currentText()
+                    
+                    # Add coordinates in selected order
+                    if is_longitude_first:
+                        # Longitude first order
+                        df['Longitude'] = df['Longitude']
+                        df['Latitude'] = df['Latitude']
+                    else:
+                        # Latitude first order
+                        df['Latitude'] = df['Latitude']
+                        df['Longitude'] = df['Longitude']
+                    
+                    # Handle height with unit conversion
+                    if 'Ellipsoidal height' in df.columns:
+                        height_col = 'Ellipsoidal height'
+                    else:
+                        height_col = 'Elevation'  # Fallback to elevation if ellipsoidal height not present
+                    
+                    # Get the input height value
+                    height_values = df[height_col].copy()
+                    
+                    # Determine input units based on coordinate system
+                    input_height_unit = 'ft' if self.is_feet_based else 'm'
+                    logger.info(f"Input height unit: {input_height_unit}, Output height unit: {output_height_unit}")
+                    
+                    # Convert if units are different
+                    if input_height_unit != output_height_unit:
+                        if input_height_unit == 'ft' and output_height_unit == 'm':
+                            # Convert from US survey feet to meters
+                            height_values = height_values / 3.28083333333333
+                            logger.info("Converting height from US survey feet to meters")
+                        elif input_height_unit == 'm' and output_height_unit == 'ft':
+                            # Convert from meters to US survey feet
+                            height_values = height_values * 3.28083333333333
+                            logger.info("Converting height from meters to US survey feet")
+                    
+                    # Add to DataFrame with unit label
+                    df[f'Ellipsoidal Height ({output_height_unit})'] = height_values
+                    
+                else:
+                    # Local coordinate system
+                    # Get column order selection
+                    is_northing_first = "Name, Northing" in self.col_order_toggle.currentText()
+                    
+                    # Copy name
+                    df['Name'] = df['Name']
+                    
+                    # Add coordinates in selected order
+                    if is_northing_first:
+                        # Northing first order
+                        df['Northing'] = df['Northing']
+                        df['Easting'] = df['Easting']
+                    else:
+                        # Easting first order
+                        df['Easting'] = df['Easting']
+                        df['Northing'] = df['Northing']
+                    
+                    df['Elevation'] = df['Elevation']
+                
+                all_data.append(df)
             
-            return combined_df
+            # Combine all data
+            if all_data:
+                combined_data = pd.concat(all_data, ignore_index=True)
+                return combined_data
+            else:
+                return None
             
         except Exception as e:
-            logger.error(f"Error in position data processing: {str(e)}")
+            logger.error(f"Error processing position data: {str(e)}")
             logger.error(traceback.format_exc())
             return None
 

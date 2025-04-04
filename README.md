@@ -21,7 +21,7 @@ An experimental tool for preparing DJI LiDAR data to be processed in DJI Terra. 
 ## How to Use
 
 1. Export a CSV from Emlid Flow using the "All Columns" configuration
-2. Put your RINEX file somewhere in your project folder
+2. Put your RINEX file somewhere in your project folder and make sure it is unzipped.
 3. Run the tool and select your project directory
 4. The tool will:
    - Find your RINEX file
