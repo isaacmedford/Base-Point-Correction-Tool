@@ -1514,32 +1514,78 @@ class DJIPPKPro(QMainWindow):
             
             # Get RINEX file path
             rinex_file = self.get_active_rinex_path()
+            if not rinex_file:
+                raise ValueError("No RINEX file selected")
             
-            # Get base station coordinates
+            # Get base station coordinates from selected point
             base_point = self.base_point_combo.currentText()
+            if not base_point or base_point == "Select Base Point...":
+                raise ValueError("Please select a base station point")
+            
             base_data = self.base_points_df[self.base_points_df['Name'] == base_point].iloc[0]
             
-            # Create worker thread
-            self.worker = RinexLoadWorker(
-                rinex_file=rinex_file,
-                base_lat=base_data['Latitude'],
-                base_lon=base_data['Longitude'],
-                base_ellh=base_data['Elevation'],
-                antenna_height=antenna_height,
-                antenna_height_units='m',  # Always in meters for RINEX
-                coord_system_units='m'  # Always in meters for RINEX
+            # Convert heights to meters and combine
+            ant_height_meters = (
+                feet_to_meters(antenna_height) 
+                if self.antenna_height_units == 'ft'
+                else antenna_height
             )
             
-            # Connect signals
-            self.worker.progress.connect(self.update_status)
-            self.worker.error.connect(self.handle_error)
-            self.worker.finished.connect(self.handle_rinex_completion)
+            ellh_meters = (
+                feet_to_meters(base_data['Ellipsoidal height'])
+                if self.is_feet_based
+                else base_data['Ellipsoidal height']
+            )
             
-            # Start worker
-            self.worker.start()
+            total_height_meters = ellh_meters + ant_height_meters
+            
+            # Convert to ECEF
+            x, y, z = convert_to_ecef(
+                base_data['Latitude'],
+                base_data['Longitude'],
+                total_height_meters
+            )
+            
+            logger.info(f"Converting coordinates:")
+            logger.info(f"Input - Lat: {base_data['Latitude']}, Lon: {base_data['Longitude']}, Height: {total_height_meters}m")
+            logger.info(f"Output ECEF - X: {x:.4f}, Y: {y:.4f}, Z: {z:.4f}")
+            
+            # Create temporary file for updated RINEX
+            temp_rinex = os.path.join(os.path.dirname(rinex_file), "temp_rinex.tmp")
+            update_rinex_header(rinex_file, temp_rinex, x, y, z)
+            
+            # Process each flight folder
+            project_dir = self.dir_input.text()
+            processed_count = 0
+            
+            for item in os.listdir(project_dir):
+                folder_path = os.path.join(project_dir, item)
+                if os.path.isdir(folder_path):
+                    # Find RTK file in folder
+                    rtk_files = [f for f in os.listdir(folder_path) if f.endswith('.RTK')]
+                    if rtk_files:
+                        rtk_base_name = os.path.splitext(rtk_files[0])[0]
+                        obs_file = os.path.join(folder_path, f"{rtk_base_name}.OBS")
+                        
+                        # Copy and rename updated RINEX file
+                        shutil.copy2(temp_rinex, obs_file)
+                        logger.info(f"Created OBS file: {obs_file}")
+                        processed_count += 1
+            
+            # Clean up temporary file
+            os.remove(temp_rinex)
+            
+            # Update status
+            self.statusBar().showMessage(f"Successfully processed {processed_count} flight folders")
+            QMessageBox.information(
+                self,
+                "Processing Complete",
+                f"Successfully created OBS files in {processed_count} flight folders."
+            )
             
         except Exception as e:
-            logger.error(f"Error starting processing: {str(e)}")
+            logger.error(f"Error in PPK processing: {str(e)}")
+            logger.error(traceback.format_exc())
             self.handle_error(str(e))
 
     def read_rinex_data(self):
@@ -2562,6 +2608,41 @@ def haversine(lon1, lat1, lon2, lat2):
     r = 6371000
     
     return c * r
+
+def feet_to_meters(feet):
+    """Convert feet to meters."""
+    return feet * 0.3048
+
+def convert_to_ecef(lat, lon, height_meters):
+    """Convert lat/lon/height to ECEF coordinates."""
+    transformer = pyproj.Transformer.from_crs(
+        "epsg:4326",  # WGS84 lat/lon
+        "epsg:4978",  # ECEF
+        always_xy=True
+    )
+    x, y, z = transformer.transform(lon, lat, height_meters)
+    return x, y, z
+
+def update_rinex_header(input_file, output_file, x, y, z):
+    """Update RINEX header with new coordinates and zero antenna height."""
+    with open(input_file, 'r') as infile, open(output_file, 'w') as outfile:
+        in_header = True
+        for line in infile:
+            if in_header:
+                if "APPROX POSITION XYZ" in line:
+                    # Format coordinates with exact spacing and decimal places
+                    new_line = f"{x:14.4f}{y:14.4f}{z:14.4f}                  APPROX POSITION XYZ \n"
+                    outfile.write(new_line)
+                elif "ANTENNA: DELTA H/E/N" in line:
+                    # Reset antenna height to zero while maintaining format
+                    outfile.write("        0.0000        0.0000        0.0000                  ANTENNA: DELTA H/E/N\n")
+                elif "END OF HEADER" in line:
+                    outfile.write(line)
+                    in_header = False
+                else:
+                    outfile.write(line)
+            else:
+                outfile.write(line)
 
 if __name__ == '__main__':
     try:
